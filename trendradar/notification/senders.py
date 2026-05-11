@@ -18,6 +18,7 @@
 import smtplib
 import time
 import json
+import re
 from datetime import datetime
 from email.header import Header
 from email.mime.multipart import MIMEMultipart
@@ -33,6 +34,9 @@ from .batch import add_batch_headers, get_max_batch_header_size
 from .formatters import convert_markdown_to_mrkdwn, strip_markdown
 
 
+NTFY_URL_RE = re.compile(r"https?://[^\s<>\]\)]+")
+
+
 def _render_ai_analysis(ai_analysis: Any, channel: str) -> str:
     """渲染 AI 分析内容为指定渠道格式"""
     if not ai_analysis:
@@ -44,6 +48,37 @@ def _render_ai_analysis(ai_analysis: Any, channel: str) -> str:
         return renderer(ai_analysis)
     except ImportError:
         return ""
+
+
+def _extract_ntfy_urls(content: str, limit: int = 3) -> list[str]:
+    """提取 ntfy 跳转按钮使用的前几个唯一 URL。"""
+    urls: list[str] = []
+    for match in NTFY_URL_RE.finditer(content):
+        url = match.group(0).rstrip(".,;:，。；：")
+        if url in urls:
+            continue
+        urls.append(url)
+        if len(urls) >= limit:
+            break
+    return urls
+
+
+def _quote_ntfy_action_value(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _build_ntfy_view_actions(urls: list[str], max_header_bytes: int = 1800) -> str:
+    actions: list[str] = []
+    for idx, url in enumerate(urls, 1):
+        action = (
+            f"action=view, label=Open {idx}, "
+            f"url={_quote_ntfy_action_value(url)}, clear=true"
+        )
+        candidate = "; ".join([*actions, action])
+        if len(candidate.encode("utf-8")) > max_header_bytes:
+            break
+        actions.append(action)
+    return "; ".join(actions)
 
 
 # === SMTP 邮件配置 ===
@@ -906,6 +941,12 @@ def send_to_ntfy(
         current_headers = headers.copy()
         if total_batches > 1:
             current_headers["Title"] = f"{report_type_en} ({actual_batch_num}/{total_batches})"
+        ntfy_urls = _extract_ntfy_urls(batch_content)
+        if ntfy_urls:
+            current_headers["Click"] = ntfy_urls[0]
+            actions = _build_ntfy_view_actions(ntfy_urls)
+            if actions:
+                current_headers["Actions"] = actions
 
         try:
             response = requests.post(
