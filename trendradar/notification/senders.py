@@ -63,22 +63,16 @@ def _extract_ntfy_urls(content: str, limit: int = 3) -> list[str]:
     return urls
 
 
-def _quote_ntfy_action_value(value: str) -> str:
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-
-def _build_ntfy_view_actions(urls: list[str], max_header_bytes: int = 1800) -> str:
-    actions: list[str] = []
+def _build_ntfy_view_actions(urls: list[str]) -> list[dict[str, Any]]:
+    actions: list[dict[str, Any]] = []
     for idx, url in enumerate(urls, 1):
-        action = (
-            f"action=view, label=Open {idx}, "
-            f"url={_quote_ntfy_action_value(url)}, clear=true"
-        )
-        candidate = "; ".join([*actions, action])
-        if len(candidate.encode("utf-8")) > max_header_bytes:
-            break
-        actions.append(action)
-    return "; ".join(actions)
+        actions.append({
+            "action": "view",
+            "label": f"Open {idx}",
+            "url": url,
+            "clear": True,
+        })
+    return actions
 
 
 # === SMTP 邮件配置 ===
@@ -860,12 +854,7 @@ def send_to_ntfy(
     }
     report_type_en = report_type_en_map.get(report_type, "News Report")
 
-    headers = {
-        "Content-Type": "text/plain; charset=utf-8",
-        "Title": report_type_en,
-        "Priority": "default",
-        "Tags": "news",
-    }
+    headers = {}
 
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -874,7 +863,6 @@ def send_to_ntfy(
     base_url = server_url.rstrip("/")
     if not base_url.startswith(("http://", "https://")):
         base_url = f"https://{base_url}"
-    url = f"{base_url}/{topic}"
 
     proxies = None
     if proxy_url:
@@ -937,22 +925,27 @@ def send_to_ntfy(
         if content_size > 4096:
             print(f"警告：{log_prefix}第 {actual_batch_num} 批次消息过大（{content_size} 字节），可能被拒绝")
 
-        # 更新 headers 的批次标识
-        current_headers = headers.copy()
+        # 更新通知标题的批次标识
+        current_title = report_type_en
         if total_batches > 1:
-            current_headers["Title"] = f"{report_type_en} ({actual_batch_num}/{total_batches})"
+            current_title = f"{report_type_en} ({actual_batch_num}/{total_batches})"
         ntfy_urls = _extract_ntfy_urls(batch_content)
+        payload = {
+            "topic": topic,
+            "message": batch_content,
+            "title": current_title,
+            "priority": 3,
+            "tags": ["news"],
+        }
         if ntfy_urls:
-            current_headers["Click"] = ntfy_urls[0]
-            actions = _build_ntfy_view_actions(ntfy_urls)
-            if actions:
-                current_headers["Actions"] = actions
+            payload["click"] = ntfy_urls[0]
+            payload["actions"] = _build_ntfy_view_actions(ntfy_urls)
 
         try:
             response = requests.post(
-                url,
-                headers=current_headers,
-                data=batch_content.encode("utf-8"),
+                base_url,
+                headers=headers,
+                json=payload,
                 proxies=proxies,
                 timeout=30,
             )
@@ -971,9 +964,9 @@ def send_to_ntfy(
                 time.sleep(10)  # 等待10秒后重试
                 # 重试一次
                 retry_response = requests.post(
-                    url,
-                    headers=current_headers,
-                    data=batch_content.encode("utf-8"),
+                    base_url,
+                    headers=headers,
+                    json=payload,
                     proxies=proxies,
                     timeout=30,
                 )
