@@ -63,16 +63,78 @@ def _extract_ntfy_urls(content: str, limit: int = 3) -> list[str]:
     return urls
 
 
-def _build_ntfy_view_actions(urls: list[str]) -> list[dict[str, Any]]:
+def _extract_ntfy_url_entries(content: str, limit: int = 3) -> list[dict[str, str]]:
+    """提取 ntfy 按钮使用的 URL，并尽量沿用新闻序号作为按钮编号。"""
+    entries: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for line in content.splitlines():
+        for match in NTFY_URL_RE.finditer(line):
+            url = match.group(0).rstrip(".,;:，。；：")
+            if url in seen_urls:
+                continue
+            number_match = re.match(r"\s*(\d+)[\.\)、]\s+", line)
+            label_num = number_match.group(1) if number_match else str(len(entries) + 1)
+            entries.append({"url": url, "label": f"Open {label_num}"})
+            seen_urls.add(url)
+            if len(entries) >= limit:
+                return entries
+    return entries
+
+
+def _build_ntfy_view_actions(entries: list[dict[str, str]]) -> list[dict[str, Any]]:
     actions: list[dict[str, Any]] = []
-    for idx, url in enumerate(urls, 1):
+    for entry in entries:
         actions.append({
             "action": "view",
-            "label": f"Open {idx}",
-            "url": url,
+            "label": entry["label"],
+            "url": entry["url"],
             "clear": True,
         })
     return actions
+
+
+def _count_ntfy_urls(line: str) -> int:
+    return len(_extract_ntfy_urls(line, 100))
+
+
+def _split_ntfy_content_by_news(content: str, max_urls: int = 3) -> list[str]:
+    """将 ntfy 消息按新闻链接拆成小通知，每条最多带 max_urls 个 Open 按钮。"""
+    if _count_ntfy_urls(content) <= max_urls:
+        return [content]
+
+    chunks: list[str] = []
+    current_lines: list[str] = []
+    pending_lines: list[str] = []
+    current_url_count = 0
+
+    for line in content.splitlines(keepends=True):
+        line_url_count = _count_ntfy_urls(line)
+        if line_url_count == 0:
+            if current_url_count >= max_urls:
+                pending_lines.append(line)
+            else:
+                current_lines.append(line)
+            continue
+
+        if current_url_count and current_url_count + line_url_count > max_urls:
+            chunk = "".join(current_lines).strip()
+            if chunk:
+                chunks.append(chunk)
+            current_lines = pending_lines + [line]
+            pending_lines = []
+            current_url_count = line_url_count
+        else:
+            current_lines.extend(pending_lines)
+            pending_lines = []
+            current_lines.append(line)
+            current_url_count += line_url_count
+
+    current_lines.extend(pending_lines)
+    final_chunk = "".join(current_lines).strip()
+    if final_chunk:
+        chunks.append(final_chunk)
+
+    return chunks or [content]
 
 
 # === SMTP 邮件配置 ===
@@ -899,37 +961,41 @@ def send_to_ntfy(
     # 统一添加批次头部（已预留空间，不会超限）
     batches = add_batch_headers(batches, "ntfy", batch_size)
 
-    total_batches = len(batches)
-    print(f"{log_prefix}消息分为 {total_batches} 批次发送 [{report_type}]")
+    # ntfy 每条通知最多支持 3 个 action buttons，按每 3 条新闻拆成更小通知。
+    send_batches: list[str] = []
+    for batch_content in batches:
+        plain_content = strip_markdown(batch_content)
+        send_batches.extend(_split_ntfy_content_by_news(plain_content, max_urls=3))
 
-    # 反转批次顺序，使得在ntfy客户端显示时顺序正确
-    # ntfy显示最新消息在上面，所以我们从最后一批开始推送
-    reversed_batches = list(reversed(batches))
+    total_batches = len(send_batches)
+    print(f"{log_prefix}消息分为 {total_batches} 条 ntfy 通知发送 [{report_type}]")
 
-    print(f"{log_prefix}将按反向顺序推送（最后批次先推送），确保客户端显示顺序正确")
+    # 反转通知顺序，使得在 ntfy 客户端显示时顺序正确。
+    # ntfy 显示最新消息在上面，所以从最后一组开始推送。
+    reversed_batches = list(reversed(send_batches))
+
+    print(f"{log_prefix}将按反向顺序推送（最后一组先推送），确保客户端显示顺序正确")
 
     # 逐批发送（反向顺序）
     success_count = 0
     for idx, batch_content in enumerate(reversed_batches, 1):
-        # 计算正确的批次编号（用户视角的编号）
+        # 计算正确的组编号（用户视角的编号）
         actual_batch_num = total_batches - idx + 1
-        # ntfy 手机端对 Markdown 链接支持不稳定，改发裸 URL 方便 App 自动识别点击。
-        batch_content = strip_markdown(batch_content)
 
         content_size = len(batch_content.encode("utf-8"))
         print(
-            f"发送{log_prefix}第 {actual_batch_num}/{total_batches} 批次（推送顺序: {idx}/{total_batches}），大小：{content_size} 字节 [{report_type}]"
+            f"发送{log_prefix}第 {actual_batch_num}/{total_batches} 组（推送顺序: {idx}/{total_batches}），大小：{content_size} 字节 [{report_type}]"
         )
 
         # 检查消息大小，确保不超过4KB
         if content_size > 4096:
-            print(f"警告：{log_prefix}第 {actual_batch_num} 批次消息过大（{content_size} 字节），可能被拒绝")
+            print(f"警告：{log_prefix}第 {actual_batch_num} 组消息过大（{content_size} 字节），可能被拒绝")
 
-        # 更新通知标题的批次标识
+        # 更新通知标题的组标识
         current_title = report_type_en
         if total_batches > 1:
             current_title = f"{report_type_en} ({actual_batch_num}/{total_batches})"
-        ntfy_urls = _extract_ntfy_urls(batch_content)
+        ntfy_entries = _extract_ntfy_url_entries(batch_content)
         payload = {
             "topic": topic,
             "message": batch_content,
@@ -937,9 +1003,9 @@ def send_to_ntfy(
             "priority": 3,
             "tags": ["news"],
         }
-        if ntfy_urls:
-            payload["click"] = ntfy_urls[0]
-            payload["actions"] = _build_ntfy_view_actions(ntfy_urls)
+        if ntfy_entries:
+            payload["click"] = ntfy_entries[0]["url"]
+            payload["actions"] = _build_ntfy_view_actions(ntfy_entries)
 
         try:
             response = requests.post(
@@ -951,7 +1017,7 @@ def send_to_ntfy(
             )
 
             if response.status_code == 200:
-                print(f"{log_prefix}第 {actual_batch_num}/{total_batches} 批次发送成功 [{report_type}]")
+                print(f"{log_prefix}第 {actual_batch_num}/{total_batches} 组发送成功 [{report_type}]")
                 success_count += 1
                 if idx < total_batches:
                     # 公共服务器建议 2-3 秒，自托管可以更短
@@ -959,7 +1025,7 @@ def send_to_ntfy(
                     time.sleep(interval)
             elif response.status_code == 429:
                 print(
-                    f"{log_prefix}第 {actual_batch_num}/{total_batches} 批次速率限制 [{report_type}]，等待后重试"
+                    f"{log_prefix}第 {actual_batch_num}/{total_batches} 组速率限制 [{report_type}]，等待后重试"
                 )
                 time.sleep(10)  # 等待10秒后重试
                 # 重试一次
@@ -971,19 +1037,19 @@ def send_to_ntfy(
                     timeout=30,
                 )
                 if retry_response.status_code == 200:
-                    print(f"{log_prefix}第 {actual_batch_num}/{total_batches} 批次重试成功 [{report_type}]")
+                    print(f"{log_prefix}第 {actual_batch_num}/{total_batches} 组重试成功 [{report_type}]")
                     success_count += 1
                 else:
                     print(
-                        f"{log_prefix}第 {actual_batch_num}/{total_batches} 批次重试失败，状态码：{retry_response.status_code}"
+                        f"{log_prefix}第 {actual_batch_num}/{total_batches} 组重试失败，状态码：{retry_response.status_code}"
                     )
             elif response.status_code == 413:
                 print(
-                    f"{log_prefix}第 {actual_batch_num}/{total_batches} 批次消息过大被拒绝 [{report_type}]，消息大小：{content_size} 字节"
+                    f"{log_prefix}第 {actual_batch_num}/{total_batches} 组消息过大被拒绝 [{report_type}]，消息大小：{content_size} 字节"
                 )
             else:
                 print(
-                    f"{log_prefix}第 {actual_batch_num}/{total_batches} 批次发送失败 [{report_type}]，状态码：{response.status_code}"
+                    f"{log_prefix}第 {actual_batch_num}/{total_batches} 组发送失败 [{report_type}]，状态码：{response.status_code}"
                 )
                 try:
                     print(f"错误详情：{response.text}")
@@ -991,19 +1057,19 @@ def send_to_ntfy(
                     pass
 
         except requests.exceptions.ConnectTimeout:
-            print(f"{log_prefix}第 {actual_batch_num}/{total_batches} 批次连接超时 [{report_type}]")
+            print(f"{log_prefix}第 {actual_batch_num}/{total_batches} 组连接超时 [{report_type}]")
         except requests.exceptions.ReadTimeout:
-            print(f"{log_prefix}第 {actual_batch_num}/{total_batches} 批次读取超时 [{report_type}]")
+            print(f"{log_prefix}第 {actual_batch_num}/{total_batches} 组读取超时 [{report_type}]")
         except requests.exceptions.ConnectionError as e:
-            print(f"{log_prefix}第 {actual_batch_num}/{total_batches} 批次连接错误 [{report_type}]：{e}")
+            print(f"{log_prefix}第 {actual_batch_num}/{total_batches} 组连接错误 [{report_type}]：{e}")
         except Exception as e:
-            print(f"{log_prefix}第 {actual_batch_num}/{total_batches} 批次发送异常 [{report_type}]：{e}")
+            print(f"{log_prefix}第 {actual_batch_num}/{total_batches} 组发送异常 [{report_type}]：{e}")
 
     # 判断整体发送是否成功
     if success_count == total_batches:
-        print(f"{log_prefix}所有 {total_batches} 批次发送完成 [{report_type}]")
+        print(f"{log_prefix}所有 {total_batches} 组发送完成 [{report_type}]")
     elif success_count > 0:
-        print(f"{log_prefix}部分发送成功：{success_count}/{total_batches} 批次 [{report_type}]")
+        print(f"{log_prefix}部分发送成功：{success_count}/{total_batches} 组 [{report_type}]")
     else:
         print(f"{log_prefix}发送完全失败 [{report_type}]")
         return False
