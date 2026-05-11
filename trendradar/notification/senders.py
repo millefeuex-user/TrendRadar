@@ -827,7 +827,6 @@ def send_to_ntfy(
 
     headers = {
         "Content-Type": "text/plain; charset=utf-8",
-        "Markdown": "yes",
         "Title": report_type_en,
         "Priority": "default",
         "Tags": "news",
@@ -891,6 +890,8 @@ def send_to_ntfy(
     for idx, batch_content in enumerate(reversed_batches, 1):
         # 计算正确的批次编号（用户视角的编号）
         actual_batch_num = total_batches - idx + 1
+        # ntfy 手机端对 Markdown 链接支持不稳定，改发裸 URL 方便 App 自动识别点击。
+        batch_content = strip_markdown(batch_content)
 
         content_size = len(batch_content.encode("utf-8"))
         print(
